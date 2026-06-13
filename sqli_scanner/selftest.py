@@ -25,9 +25,11 @@ from urllib.parse import parse_qs, urlparse
 
 from . import (
     access_control_detector,
+    bypass_detector,
     cors_detector,
     csrf_detector,
     headers_detector,
+    info_disclosure_detector,
     open_redirect_detector,
     parser,
     reporter,
@@ -241,11 +243,55 @@ class FakeNoHeadersSession:
 
 
 # ---------------------------------------------------------------------------
+# Information disclosure mock
+# ---------------------------------------------------------------------------
+class FakeInfoDiscSession:
+    """Exposes /.env (with an AWS-key-like secret) and leaks a stack trace."""
+
+    def get(self, url, timeout=None, allow_redirects=False, headers=None, **kwargs):
+        path = urlparse(url).path
+        if path == "/.env":
+            return FakeResponse(
+                "DB_PASSWORD=supersecret\nAWS_KEY=AKIAIOSFODNN7EXAMPLE\n", 200)
+        if path in ("", "/"):
+            return FakeResponse(
+                "<html>Server error: Traceback (most recent call last): "
+                "File 'app.py', line 1</html>", 200,
+                headers={"Content-Type": "text/html", "Server": "Apache/2.4.1"})
+        return FakeResponse("<html>404 not found</html>", 404)
+
+    def post(self, url, data=None, timeout=None, allow_redirects=False, **kwargs):
+        return self.get(url)
+
+
+# ---------------------------------------------------------------------------
+# 403/404 bypass mock
+# ---------------------------------------------------------------------------
+class FakeBypassSession:
+    """/admin is 403, but /admin/ (and an override header) leak a 200."""
+
+    def get(self, url, timeout=None, allow_redirects=False, headers=None, **kwargs):
+        path = urlparse(url).path
+        if path == "/admin":
+            if headers and ("X-Original-URL" in headers
+                            or "X-Custom-IP-Authorization" in headers):
+                return FakeResponse("<html>admin panel: users list</html>", 200)
+            return FakeResponse("Forbidden", 403)
+        if path == "/admin/":
+            return FakeResponse("<html>admin panel: users list, longer body</html>", 200)
+        return FakeResponse("not found", 404)
+
+    def post(self, url, data=None, timeout=None, allow_redirects=False, **kwargs):
+        return self.get(url)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _new_scanner(session) -> Scanner:
+def _new_scanner(session, concurrency: int = 1) -> Scanner:
     return Scanner(session, ScanConfig(delay=0.0, timeout=8.0, time_delay=2,
-                                       confirm_repeats=1, baseline_samples=2))
+                                       confirm_repeats=1, baseline_samples=2,
+                                       concurrency=concurrency))
 
 
 def _print(name: str, scanner: Scanner, target: str) -> None:
@@ -391,6 +437,34 @@ def main() -> int:  # noqa: C901 - linear test script
     _print("idor", s, "http://app.local/account?id=5")
     results.append(("IDOR surface flagged (Info)",
                     any(f.category == "IDOR" for f in s.findings)))
+
+    # 16) Information disclosure (concurrent) ----------------------------
+    print("\n=== Case: Information disclosure (.env + stack trace) [concurrency=4] ===")
+    s = _new_scanner(FakeInfoDiscSession(), concurrency=4)
+    info_disclosure_detector.run(s, "http://app.local/")
+    _print("infodisclosure", s, "http://app.local/")
+    info_ok = any(f.category == "InfoDisclosure" for f in s.findings)
+    info_high = any(f.category == "InfoDisclosure" and f.severity in ("High", "Critical")
+                    for f in s.findings)
+    results.append(("Information disclosure detected (exposed path/secret)",
+                    info_ok and info_high))
+
+    # 17) 403/404 bypass (concurrent) ------------------------------------
+    print("\n=== Case: 403/404 bypass (/admin) [concurrency=4] ===")
+    s = _new_scanner(FakeBypassSession(), concurrency=4)
+    bypass_detector.run(s, "http://app.local/")
+    _print("bypass", s, "http://app.local/")
+    results.append(("403/404 bypass detected",
+                    any(f.category == "AccessControlBypass" and f.confirmed
+                        for f in s.findings)))
+
+    # 18) Live-finding callback fires ------------------------------------
+    print("\n=== Case: live-finding streaming callback ===")
+    streamed = []
+    s = _new_scanner(FakeXSSSession())
+    s.on_finding = lambda f: streamed.append(f)
+    xss_detector.run(s, [parser.build_request_from_url("http://app.local/search?q=hi")])
+    results.append(("Live callback fired for findings", len(streamed) >= 1))
 
     # --- Summary --------------------------------------------------------
     print("\n" + "=" * 60)

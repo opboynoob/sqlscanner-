@@ -117,6 +117,7 @@ def test_point(scanner: Scanner, point: InjectionPoint) -> Optional[Finding]:
 def run(scanner: Scanner, templates: List[RequestTemplate]) -> List[Finding]:
     found: List[Finding] = []
     seen = set()
+    points = []
     for template in templates:
         if template.is_unsafe():
             continue
@@ -125,12 +126,14 @@ def run(scanner: Scanner, templates: List[RequestTemplate]) -> List[Finding]:
             if key in seen:
                 continue
             seen.add(key)
-            try:
-                finding = test_point(scanner, point)
-            except RequestBudgetError:
-                logger.warning("Request budget exhausted during SSTI scan.")
-                return found
-            if finding is not None:
-                scanner.note_finding(finding)
-                found.append(finding)
+            points.append(point)
+
+    def _worker(point):
+        finding = test_point(scanner, point)
+        if finding is not None:
+            scanner.note_finding(finding)
+            found.append(finding)
+        return finding
+
+    scanner.parallel_map(points, _worker)
     return found

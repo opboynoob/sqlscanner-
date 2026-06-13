@@ -33,6 +33,8 @@ from . import (
     cors_detector,
     headers_detector,
     access_control_detector,
+    info_disclosure_detector,
+    bypass_detector,
 )
 from .crawler import Crawler, CrawlConfig
 from .scanner import Scanner, ScanConfig
@@ -40,10 +42,10 @@ from .scanner import Scanner, ScanConfig
 LOG = logging.getLogger("sqli_scanner")
 
 ALL_CHECKS = ("sqli", "xss", "csrf", "ssrf", "xxe", "openredirect", "ssti",
-              "cors", "headers", "idor")
+              "cors", "headers", "idor", "infodisclosure", "bypass")
 # xxe and idor are opt-in (XXE needs an XML endpoint; IDOR is informational).
 DEFAULT_CHECKS = ("sqli", "xss", "csrf", "ssrf", "openredirect", "ssti",
-                  "cors", "headers")
+                  "cors", "headers", "infodisclosure", "bypass")
 
 BANNER = r"""
   __        __   _    ____                  _   _      _
@@ -51,12 +53,13 @@ BANNER = r"""
    \ \ /\ / / _ \ '_ \___ \ / __/ _` | '_ \|  \| |/ _ \ __|
     \ V  V /  __/ |_) |__) | (_| (_| | | | | |\  |  __/ |_
      \_/\_/ \___|_.__/____/ \___\__,_|_| |_|_| \_|\___|\__|
-   Defensive Web Vulnerability Detection Scanner v3.0
-   SQLi | XSS | XXE | CSRF | SSRF | Open Redirect | SSTI
-        | CORS | Security Headers | IDOR surface
+   Defensive Web Vulnerability Detection Scanner v4.0
+   SQLi XSS XXE CSRF SSRF OpenRedirect SSTI CORS Headers
+        IDOR  InfoDisclosure  403/404-Bypass
    ---------------------------------------------------
    AUTHORIZED SECURITY TESTING ONLY. Detection-only:
-   no data extraction, no exploitation, no WAF bypass.
+   reports issues; never exploits, dumps, or bypasses
+   beyond confirming a misconfiguration exists.
 """
 
 
@@ -76,9 +79,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     # Check selection
     p.add_argument("--checks", default=None,
                    help="Comma-separated subset of checks to run (choices: "
-                        "sqli,xss,csrf,ssrf,xxe,openredirect,ssti,cors,headers,idor). "
-                        "Default: sqli,xss,csrf,ssrf,openredirect,ssti,cors,headers "
-                        "(xxe and idor are opt-in).")
+                        "sqli,xss,csrf,ssrf,xxe,openredirect,ssti,cors,headers,"
+                        "idor,infodisclosure,bypass). "
+                        "Default runs everything except xxe/idor (opt-in).")
     p.add_argument("--ssrf-canary", default=None,
                    help="Your OWN public OAST/canary URL for safe SSRF "
                         "confirmation. Internal/loopback/metadata targets are "
@@ -97,9 +100,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         "SameSite attributes.")
 
     # Crawling / scope
-    p.add_argument("--max-depth", type=int, default=2,
+    p.add_argument("--max-depth", type=int, default=3,
                    help="Maximum crawl depth on the same host.")
-    p.add_argument("--max-pages", type=int, default=50,
+    p.add_argument("--max-pages", type=int, default=120,
                    help="Maximum number of pages to crawl.")
     p.add_argument("--no-crawl", action="store_true",
                    help="Disable crawling; only test the supplied URL.")
@@ -108,13 +111,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-robots", action="store_true",
                    help="Do not fetch/respect robots.txt (still same-host only).")
 
-    # Safety controls
-    p.add_argument("--delay", type=float, default=0.3,
+    # Safety / performance controls
+    p.add_argument("--delay", type=float, default=0.2,
                    help="Delay between requests in seconds.")
     p.add_argument("--timeout", type=float, default=10.0,
                    help="Per-request timeout in seconds.")
-    p.add_argument("--max-requests", type=int, default=500,
+    p.add_argument("--max-requests", type=int, default=3000,
                    help="Hard cap on total HTTP requests (safety budget).")
+    p.add_argument("--concurrency", type=int, default=6,
+                   help="Parallel workers for independent checks (SQLi stays "
+                        "sequential to keep timing-based detection accurate).")
+    p.add_argument("--fast", action="store_true",
+                   help="Speed preset: delay=0, concurrency=12, larger budget.")
+    p.add_argument("--no-live", action="store_true",
+                   help="Do not stream findings live during the scan.")
     p.add_argument("--time-delay", type=int, default=5,
                    help="Requested delay (s) for time-based probes (clamped 2-10).")
     p.add_argument("--no-time-based", action="store_true",
@@ -312,10 +322,19 @@ def run(args) -> int:
     enabled_checks = resolve_checks(args)
     LOG.info("Enabled checks: %s", ", ".join(sorted(enabled_checks)))
 
+    # Performance presets.
+    concurrency = max(1, args.concurrency)
+    delay = args.delay
+    max_requests = args.max_requests
+    if args.fast:
+        delay = 0.0
+        concurrency = max(concurrency, 12)
+        max_requests = max(max_requests, 5000)
+
     scan_config = ScanConfig(
-        delay=args.delay,
+        delay=delay,
         timeout=args.timeout,
-        max_requests=args.max_requests,
+        max_requests=max_requests,
         time_delay=args.time_delay,
         enable_time_based=not args.no_time_based,
         allow_destructive_methods=args.allow_destructive_methods,
@@ -327,41 +346,56 @@ def run(args) -> int:
         enable_xxe="xxe" in enabled_checks,
         ssrf_canary=args.ssrf_canary,
         xml_body=args.xml_body,
+        concurrency=concurrency,
     )
     scanner = Scanner(session, scan_config)
 
-    # Each detector appends its findings to the shared scanner via note_finding
-    # (SQLi appends internally), so we collect from scanner.findings at the end.
-    # Modules catch their own budget-exhaustion and return early.
+    # Stream findings live as they are discovered (unless disabled).
+    if not args.no_live:
+        scanner.on_finding = lambda f: reporter.live_finding_line(
+            f, use_color=not args.no_color)
+
+    def _phase(msg):
+        if not args.no_color or True:
+            reporter.print_phase(msg, use_color=not args.no_color)
+
+    # Each detector records findings via the shared scanner (thread-safe),
+    # so the live stream and final report stay consistent.
     if scan_config.enable_sqli:
-        LOG.info("Running SQL injection checks...")
+        _phase("SQL injection (sequential, timing-accurate)...")
         scanner.scan_templates(templates)
     if scan_config.enable_xss:
-        LOG.info("Running reflected XSS checks...")
+        _phase("Reflected XSS...")
         xss_detector.run(scanner, templates)
     if scan_config.enable_csrf:
-        LOG.info("Running CSRF checks (passive)...")
+        _phase("CSRF (passive form analysis)...")
         csrf_detector.run(scanner, templates, check_cookies=args.csrf_cookie_check)
     if scan_config.enable_ssrf:
-        LOG.info("Running SSRF checks...")
+        _phase("SSRF...")
         ssrf_detector.run(scanner, templates, canary=scan_config.ssrf_canary)
     if scan_config.enable_xxe:
-        LOG.info("Running XXE checks (safe internal-entity probe)...")
+        _phase("XXE (safe internal-entity probe)...")
         xxe_detector.run(scanner, args.url, xml_body=scan_config.xml_body)
     if "openredirect" in enabled_checks:
-        LOG.info("Running open redirect checks...")
+        _phase("Open redirect...")
         open_redirect_detector.run(scanner, templates)
     if "ssti" in enabled_checks:
-        LOG.info("Running SSTI checks (arithmetic marker only)...")
+        _phase("SSTI (arithmetic marker only)...")
         ssti_detector.run(scanner, templates)
     if "cors" in enabled_checks:
-        LOG.info("Running CORS misconfiguration checks...")
+        _phase("CORS misconfiguration...")
         cors_detector.run(scanner, templates)
     if "headers" in enabled_checks:
-        LOG.info("Running security header / cookie checks...")
+        _phase("Security headers / cookie flags...")
         headers_detector.run(scanner, args.url)
+    if "infodisclosure" in enabled_checks:
+        _phase("Information disclosure / exposed sensitive paths...")
+        info_disclosure_detector.run(scanner, args.url, extra_urls=visited[:20])
+    if "bypass" in enabled_checks:
+        _phase("403/404 access-control bypass...")
+        bypass_detector.run(scanner, args.url)
     if "idor" in enabled_checks:
-        LOG.info("Running IDOR/access-control surface checks (informational)...")
+        _phase("IDOR / access-control surface (informational)...")
         access_control_detector.run(scanner, templates)
 
     findings = scanner.findings
