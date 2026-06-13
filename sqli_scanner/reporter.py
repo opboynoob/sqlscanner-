@@ -60,6 +60,28 @@ def _sorted_findings(findings: List[Finding]) -> List[Finding]:
     )
 
 
+_SEV_ICON = {
+    "Critical": "[!!]", "High": "[!]", "Medium": "[*]", "Low": "[-]", "Info": "[i]",
+}
+
+
+def live_finding_line(finding: Finding, use_color: bool = True) -> None:
+    """Print a single finding immediately as it is discovered (streaming UI)."""
+    sev = effective_severity(finding)
+    icon = _SEV_ICON.get(sev, "[*]")
+    status = "CONFIRMED" if finding.confirmed else "possible"
+    sev_tag = _c(f"{icon} {sev:<8}", sev, use_color)
+    cat = _c(f"{finding.category:<18}", "bold", use_color)
+    where = finding.param if finding.param else finding.url
+    line = f"  {sev_tag} {cat} {finding.vuln_type}  ->  {where}  ({status})"
+    print(line, flush=True)
+
+
+def print_phase(message: str, use_color: bool = True) -> None:
+    """Print a scan-phase header line during the scan."""
+    print(_c(f"\n[>] {message}", "bold", use_color), flush=True)
+
+
 def build_report_dict(
     target: str,
     findings: List[Finding],

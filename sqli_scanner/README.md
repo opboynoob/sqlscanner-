@@ -10,9 +10,11 @@ vulnerability classes with low false positives.
 XML External Entity (XXE) · Cross-Site Request Forgery (CSRF) ·
 Server-Side Request Forgery (SSRF) · Open Redirect · Server-Side Template
 Injection (SSTI) · CORS misconfiguration · missing/weak security headers &
-cookie flags · IDOR / broken-access-control surface. Findings are rated on a
-five-level severity scale (Critical/High/Medium/Low/Info) with CWE and
-OWASP Top 10 (2021) mapping.
+cookie flags · IDOR / broken-access-control surface · **Information disclosure /
+exposed sensitive paths & secrets** · **403/404 access-control bypass**.
+Findings stream **live during the scan**, are rated on a five-level severity
+scale (Critical/High/Medium/Low/Info) with CWE and OWASP Top 10 (2021) mapping,
+and the scan runs **concurrently** for speed.
 
 ---
 
@@ -62,6 +64,8 @@ developer can fix it.
 | **CORS** | Sends an attacker-style `Origin` and inspects `Access-Control-Allow-Origin` / `-Allow-Credentials` for reflected/`null`/wildcard+credentials policies | Reflected origin (+creds) → Confirmed |
 | **Security headers** | One GET; reports missing CSP, X-Frame-Options/clickjacking, HSTS (HTTPS), X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and weak `Set-Cookie` flags | Observable → Confirmed (Low/Info) |
 | **IDOR surface** | Passively flags object-reference parameters (numeric IDs, UUID/hash, id-like names) for manual authorization review — never accesses other identities' data | Informational only |
+| **Information disclosure** | Probes a bounded list of commonly-exposed paths (`/.env`, `/.git/config`, backups, `/server-status`, `/actuator/env`, ...) and scans responses for stack traces, directory listings, server banners, and secret patterns (AWS keys, private keys, JWTs). **Reports existence and a *redacted* hint — never exfiltrates the data.** | Exposed path / secret → Confirmed |
+| **403/404 bypass** | For blocked paths, tries benign path-normalization variants and rewrite/override headers (X-Original-URL, etc.) and flags when the resource becomes reachable. **Compares only status/size — protected content is not read.** | Reproducible bypass → Confirmed |
 
 A finding is marked **Confirmed** only when its detector's confirmation policy
 is satisfied; everything else is reported as **Possible** to keep false
@@ -115,11 +119,15 @@ Run `python3 -m sqli_scanner.main --help` for all options.
 
 | Option | Purpose |
 |--------|---------|
-| `--checks ...` | Subset to run (default: `sqli,xss,csrf,ssrf,openredirect,ssti,cors,headers`; `xxe` and `idor` are opt-in). Full list: `sqli,xss,csrf,ssrf,xxe,openredirect,ssti,cors,headers,idor` |
+| `--checks ...` | Subset to run. Full list: `sqli,xss,csrf,ssrf,xxe,openredirect,ssti,cors,headers,idor,infodisclosure,bypass`. Default runs everything except `xxe`/`idor` (opt-in). |
+| `--fast` | Speed preset: no delay, concurrency 12, larger budget |
+| `--concurrency N` | Parallel workers for independent checks (default 6; SQLi stays sequential for timing accuracy) |
+| `--no-live` | Disable live finding stream (still prints final summary) |
 | `--ssrf-canary URL` | Your public OAST/canary URL for safe SSRF confirmation (internal targets refused) |
 | `--test-xml` / `--xml-body` | Enable the XXE check / supply a raw XML body |
 | `--idor` | Enable IDOR / access-control surface identification (informational) |
 | `--csrf-cookie-check` | Also inspect `Set-Cookie` `SameSite` for CSRF |
+| `--delay` / `--timeout` / `--max-requests` | Safety controls (defaults: 0.2s / 10s / 3000) |
 | `--delay` / `--timeout` / `--max-requests` | Safety controls |
 | `--cookie` / `--header` | Authenticated testing |
 | `--json-report` / `--html-report` | Output reports |
@@ -159,9 +167,11 @@ sqli_scanner/
 ├── cors_detector.py           # CORS misconfiguration
 ├── headers_detector.py        # security headers + cookie flags
 ├── access_control_detector.py # IDOR / access-control surface (info)
+├── info_disclosure_detector.py # exposed paths + secret/disclosure patterns
+├── bypass_detector.py          # 403/404 access-control bypass
 ├── severity.py       # severity scoring + OWASP Top 10 mapping
-├── reporter.py       # console / JSON / HTML reporting (severity-sorted)
-├── main.py           # CLI entry point
+├── reporter.py       # console (live + summary) / JSON / HTML, severity-sorted
+├── main.py           # CLI entry point (concurrency, --fast, live stream)
 ├── selftest.py       # offline pipeline test (no network/deps)
 ├── requirements.txt
 └── README.md

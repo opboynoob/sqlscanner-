@@ -26,9 +26,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import statistics
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from . import detector, parser
 from .detector import ResponseMetrics, SignalResult
@@ -72,6 +74,7 @@ class ScanConfig:
     enable_xxe: bool = False           # opt-in (needs an XML-accepting endpoint)
     ssrf_canary: Optional[str] = None  # user-controlled OAST domain for SSRF
     xml_body: Optional[str] = None     # optional raw XML body for XXE probing
+    concurrency: int = 1               # parallel workers for independent checks
 
 
 @dataclass
@@ -138,6 +141,48 @@ class Scanner:
         self.config = config or ScanConfig()
         self.stats = ScanStats()
         self.findings: List[Finding] = []
+        # Thread-safety for concurrent checks + a live-finding callback hook.
+        self._lock = threading.RLock()
+        self.on_finding: Optional[Callable[["Finding"], None]] = None
+
+    def _reserve_request(self) -> None:
+        """Atomically check the budget and reserve one request slot.
+
+        Raises RequestBudgetError if the global budget is exhausted. Counting at
+        reservation time keeps the cap correct even under concurrency.
+        """
+        with self._lock:
+            if self.stats.requests_sent >= self.config.max_requests:
+                self.stats.budget_exhausted = True
+                raise RequestBudgetError("Global request budget exhausted.")
+            self.stats.requests_sent += 1
+
+    def parallel_map(self, items, worker):
+        """Run ``worker(item)`` over items, concurrently when configured.
+
+        Workers are responsible for recording their own findings via
+        ``note_finding`` (which is thread-safe). RequestBudgetError from a worker
+        is swallowed so the pool drains cleanly. Returns the list of results.
+        """
+        items = list(items)
+        workers = max(1, int(self.config.concurrency))
+        if workers == 1 or len(items) <= 1:
+            results = []
+            for it in items:
+                try:
+                    results.append(worker(it))
+                except RequestBudgetError:
+                    break
+            return results
+
+        def _safe(it):
+            try:
+                return worker(it)
+            except RequestBudgetError:
+                return None
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            return list(ex.map(_safe, items))
 
     # ------------------------------------------------------------------
     # Low-level request with budget + safety enforcement
@@ -154,14 +199,12 @@ class Scanner:
         Enforces the request budget, delay, timeout, and the destructive-method
         guard.
         """
-        if self.stats.requests_sent >= self.config.max_requests:
-            self.stats.budget_exhausted = True
-            raise RequestBudgetError("Global request budget exhausted.")
-
         method = method.upper()
         if method not in ("GET", "POST") and not self.config.allow_destructive_methods:
             logger.warning("Refusing non-GET/POST method %s (destructive guard).", method)
             return None
+
+        self._reserve_request()  # atomic budget check + count
 
         time.sleep(self.config.delay)
         start = time.perf_counter()
@@ -186,10 +229,7 @@ class Scanner:
             # A timeout on a time-based probe is meaningful; report elapsed.
             elapsed = time.perf_counter() - start
             logger.debug("Request error (%s) for %s after %.2fs", exc, url, elapsed)
-            self.stats.requests_sent += 1
             return None
-        finally:
-            self.stats.requests_sent += 1
 
         elapsed = time.perf_counter() - start
         text = resp.text or ""
@@ -222,10 +262,6 @@ class Scanner:
         (e.g. redirect ``Location`` for SSRF, ``Set-Cookie`` for CSRF). Supports
         a ``raw_body`` with an explicit ``content_type`` (used for XML probes).
         """
-        if self.stats.requests_sent >= self.config.max_requests:
-            self.stats.budget_exhausted = True
-            raise RequestBudgetError("Global request budget exhausted.")
-
         method = method.upper()
         if method not in ("GET", "POST") and not self.config.allow_destructive_methods:
             logger.warning("Refusing non-GET/POST method %s (destructive guard).", method)
@@ -235,6 +271,7 @@ class Scanner:
         if content_type:
             headers["Content-Type"] = content_type
 
+        self._reserve_request()  # atomic budget check + count
         time.sleep(self.config.delay)
         start = time.perf_counter()
         try:
@@ -262,10 +299,7 @@ class Scanner:
                 )
         except Exception as exc:
             logger.debug("send_full error (%s) for %s", exc, url)
-            self.stats.requests_sent += 1
             return None
-        finally:
-            self.stats.requests_sent += 1
 
         elapsed = time.perf_counter() - start
         text = resp.text or ""
@@ -291,14 +325,24 @@ class Scanner:
                               allow_redirects=allow_redirects)
 
     def note_finding(self, finding: "Finding") -> None:
-        """Record a finding from an external detector and update counters."""
-        self.findings.append(finding)
-        if finding.confirmed:
-            self.stats.confirmed += 1
-        else:
-            self.stats.possible += 1
-        logger.info("Finding: %s param='%s' confidence=%s",
-                    finding.vuln_type, finding.param, finding.confidence)
+        """Record a finding (thread-safe) and fire the live-finding callback."""
+        with self._lock:
+            self.findings.append(finding)
+            if finding.confirmed:
+                self.stats.confirmed += 1
+            else:
+                self.stats.possible += 1
+            logger.info("Finding: %s param='%s' confidence=%s",
+                        finding.vuln_type, finding.param, finding.confidence)
+            callback = self.on_finding
+        # Invoke callback outside the structural mutation but still serialized by
+        # the RLock to keep live console output from interleaving.
+        if callback is not None:
+            with self._lock:
+                try:
+                    callback(finding)
+                except Exception:  # never let reporting break the scan
+                    logger.debug("on_finding callback raised", exc_info=True)
 
     # ------------------------------------------------------------------
     # Baseline & stability
@@ -580,11 +624,6 @@ class Scanner:
             reproduction=repro,
             confirmed=len(set(techniques)) >= 2,
         )
-
-        if finding.confirmed:
-            self.stats.confirmed += 1
-        else:
-            self.stats.possible += 1
         return finding
 
     @staticmethod
@@ -647,9 +686,5 @@ class Scanner:
                     logger.warning("Request budget exhausted; stopping scan.")
                     return self.findings
                 if finding is not None:
-                    self.findings.append(finding)
-                    logger.info(
-                        "Finding: %s param='%s' confidence=%s",
-                        finding.vuln_type, finding.param, finding.confidence,
-                    )
+                    self.note_finding(finding)
         return self.findings
