@@ -27,13 +27,23 @@ from urllib.parse import urlparse
 from . import parser as param_parser
 from . import reporter
 from . import xss_detector, xxe_detector, csrf_detector, ssrf_detector
+from . import (
+    open_redirect_detector,
+    ssti_detector,
+    cors_detector,
+    headers_detector,
+    access_control_detector,
+)
 from .crawler import Crawler, CrawlConfig
 from .scanner import Scanner, ScanConfig
 
 LOG = logging.getLogger("sqli_scanner")
 
-ALL_CHECKS = ("sqli", "xss", "csrf", "ssrf", "xxe")
-DEFAULT_CHECKS = ("sqli", "xss", "csrf", "ssrf")  # xxe is opt-in
+ALL_CHECKS = ("sqli", "xss", "csrf", "ssrf", "xxe", "openredirect", "ssti",
+              "cors", "headers", "idor")
+# xxe and idor are opt-in (XXE needs an XML endpoint; IDOR is informational).
+DEFAULT_CHECKS = ("sqli", "xss", "csrf", "ssrf", "openredirect", "ssti",
+                  "cors", "headers")
 
 BANNER = r"""
   __        __   _    ____                  _   _      _
@@ -41,8 +51,9 @@ BANNER = r"""
    \ \ /\ / / _ \ '_ \___ \ / __/ _` | '_ \|  \| |/ _ \ __|
     \ V  V /  __/ |_) |__) | (_| (_| | | | | |\  |  __/ |_
      \_/\_/ \___|_.__/____/ \___\__,_|_| |_|_| \_|\___|\__|
-   Defensive Web Vulnerability Detection Scanner v2.0
-   Detects: SQLi  |  XSS  |  XXE  |  CSRF  |  SSRF
+   Defensive Web Vulnerability Detection Scanner v3.0
+   SQLi | XSS | XXE | CSRF | SSRF | Open Redirect | SSTI
+        | CORS | Security Headers | IDOR surface
    ---------------------------------------------------
    AUTHORIZED SECURITY TESTING ONLY. Detection-only:
    no data extraction, no exploitation, no WAF bypass.
@@ -64,9 +75,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Check selection
     p.add_argument("--checks", default=None,
-                   help="Comma-separated subset of checks to run "
-                        "(choices: sqli,xss,csrf,ssrf,xxe). "
-                        "Default: sqli,xss,csrf,ssrf (xxe is opt-in).")
+                   help="Comma-separated subset of checks to run (choices: "
+                        "sqli,xss,csrf,ssrf,xxe,openredirect,ssti,cors,headers,idor). "
+                        "Default: sqli,xss,csrf,ssrf,openredirect,ssti,cors,headers "
+                        "(xxe and idor are opt-in).")
     p.add_argument("--ssrf-canary", default=None,
                    help="Your OWN public OAST/canary URL for safe SSRF "
                         "confirmation. Internal/loopback/metadata targets are "
@@ -74,6 +86,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--test-xml", action="store_true",
                    help="Enable the XXE check (POSTs benign XML with an internal "
                         "entity). Only meaningful for XML-accepting endpoints.")
+    p.add_argument("--idor", action="store_true",
+                   help="Enable IDOR / access-control surface identification "
+                        "(informational only).")
     p.add_argument("--xml-body", default=None,
                    help="Optional raw XML body used to confirm an XML endpoint "
                         "(the XXE probe always uses a safe internal entity).")
@@ -226,6 +241,8 @@ def resolve_checks(args) -> set:
     # --test-xml is a convenience switch for enabling XXE.
     if args.test_xml:
         enabled.add("xxe")
+    if args.idor:
+        enabled.add("idor")
     if not enabled:
         LOG.warning("No valid checks selected; defaulting to: %s", ", ".join(DEFAULT_CHECKS))
         enabled = set(DEFAULT_CHECKS)
@@ -331,6 +348,21 @@ def run(args) -> int:
     if scan_config.enable_xxe:
         LOG.info("Running XXE checks (safe internal-entity probe)...")
         xxe_detector.run(scanner, args.url, xml_body=scan_config.xml_body)
+    if "openredirect" in enabled_checks:
+        LOG.info("Running open redirect checks...")
+        open_redirect_detector.run(scanner, templates)
+    if "ssti" in enabled_checks:
+        LOG.info("Running SSTI checks (arithmetic marker only)...")
+        ssti_detector.run(scanner, templates)
+    if "cors" in enabled_checks:
+        LOG.info("Running CORS misconfiguration checks...")
+        cors_detector.run(scanner, templates)
+    if "headers" in enabled_checks:
+        LOG.info("Running security header / cookie checks...")
+        headers_detector.run(scanner, args.url)
+    if "idor" in enabled_checks:
+        LOG.info("Running IDOR/access-control surface checks (informational)...")
+        access_control_detector.run(scanner, templates)
 
     findings = scanner.findings
 

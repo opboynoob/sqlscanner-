@@ -8,7 +8,11 @@ vulnerability classes with low false positives.
 
 **Detects:** SQL Injection (SQLi) · Reflected Cross-Site Scripting (XSS) ·
 XML External Entity (XXE) · Cross-Site Request Forgery (CSRF) ·
-Server-Side Request Forgery (SSRF).
+Server-Side Request Forgery (SSRF) · Open Redirect · Server-Side Template
+Injection (SSTI) · CORS misconfiguration · missing/weak security headers &
+cookie flags · IDOR / broken-access-control surface. Findings are rated on a
+five-level severity scale (Critical/High/Medium/Low/Info) with CWE and
+OWASP Top 10 (2021) mapping.
 
 ---
 
@@ -53,11 +57,17 @@ developer can fix it.
 | **XXE** | Safe **internal** entity-expansion probe + XML parser error fingerprinting (never uses `SYSTEM`/external entities) | Entity expanded & literal reference gone → Confirmed |
 | **CSRF** | Passive analysis of state-changing POST forms for a server-validated anti-CSRF token; optional cookie `SameSite` inspection | Reported as *Possible* (manual verification advised) |
 | **SSRF** | Passive identification of URL-accepting parameters; optional **user-supplied public canary** for out-of-band confirmation | Passive = *Possible*; confirm via your own listener |
+| **Open Redirect** | Injects a benign external (RFC2606) canary URL and checks for off-site `Location` / meta-refresh / JS redirect; redirect is never followed | Reproducible off-site redirect → Confirmed |
+| **SSTI** | Injects benign arithmetic (e.g. `{{1337*7}}`) wrapped in a marker and checks the *computed* result is rendered — no object traversal or code/command execution | Evaluated expression → Confirmed |
+| **CORS** | Sends an attacker-style `Origin` and inspects `Access-Control-Allow-Origin` / `-Allow-Credentials` for reflected/`null`/wildcard+credentials policies | Reflected origin (+creds) → Confirmed |
+| **Security headers** | One GET; reports missing CSP, X-Frame-Options/clickjacking, HSTS (HTTPS), X-Content-Type-Options, Referrer-Policy, Permissions-Policy, and weak `Set-Cookie` flags | Observable → Confirmed (Low/Info) |
+| **IDOR surface** | Passively flags object-reference parameters (numeric IDs, UUID/hash, id-like names) for manual authorization review — never accesses other identities' data | Informational only |
 
 A finding is marked **Confirmed** only when its detector's confirmation policy
 is satisfied; everything else is reported as **Possible** to keep false
-positives low. Each finding carries a confidence (Low/Medium/High), risk level,
-and CWE / OWASP mapping.
+positives low. Each finding carries a **severity** (Critical/High/Medium/Low/
+Info) with an approximate CVSS band, a confidence (Low/Medium/High), and a
+CWE / OWASP Top 10 mapping. Reports are sorted most-severe first.
 
 ---
 
@@ -105,9 +115,10 @@ Run `python3 -m sqli_scanner.main --help` for all options.
 
 | Option | Purpose |
 |--------|---------|
-| `--checks sqli,xss,csrf,ssrf,xxe` | Subset of checks to run (default: `sqli,xss,csrf,ssrf`; `xxe` is opt-in) |
+| `--checks ...` | Subset to run (default: `sqli,xss,csrf,ssrf,openredirect,ssti,cors,headers`; `xxe` and `idor` are opt-in). Full list: `sqli,xss,csrf,ssrf,xxe,openredirect,ssti,cors,headers,idor` |
 | `--ssrf-canary URL` | Your public OAST/canary URL for safe SSRF confirmation (internal targets refused) |
 | `--test-xml` / `--xml-body` | Enable the XXE check / supply a raw XML body |
+| `--idor` | Enable IDOR / access-control surface identification (informational) |
 | `--csrf-cookie-check` | Also inspect `Set-Cookie` `SameSite` for CSRF |
 | `--delay` / `--timeout` / `--max-requests` | Safety controls |
 | `--cookie` / `--header` | Authenticated testing |
@@ -143,7 +154,13 @@ sqli_scanner/
 ├── xxe_detector.py   # safe XXE (internal entity expansion) detection
 ├── csrf_detector.py  # passive CSRF analysis
 ├── ssrf_detector.py  # SSRF surface ID + optional safe canary
-├── reporter.py       # console / JSON / HTML reporting
+├── open_redirect_detector.py  # open redirect (safe external canary)
+├── ssti_detector.py           # SSTI (arithmetic marker, no code exec)
+├── cors_detector.py           # CORS misconfiguration
+├── headers_detector.py        # security headers + cookie flags
+├── access_control_detector.py # IDOR / access-control surface (info)
+├── severity.py       # severity scoring + OWASP Top 10 mapping
+├── reporter.py       # console / JSON / HTML reporting (severity-sorted)
 ├── main.py           # CLI entry point
 ├── selftest.py       # offline pipeline test (no network/deps)
 ├── requirements.txt

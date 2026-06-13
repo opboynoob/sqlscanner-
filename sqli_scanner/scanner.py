@@ -110,6 +110,7 @@ class Finding:
     cwe: str = CWE_SQLI
     owasp: str = OWASP_SQLI
     confirmed: bool = False
+    severity: str = ""  # Critical/High/Medium/Low/Info; derived if left blank
 
 
 @dataclass

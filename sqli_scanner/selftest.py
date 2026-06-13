@@ -24,10 +24,15 @@ from typing import Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 from . import (
+    access_control_detector,
+    cors_detector,
     csrf_detector,
+    headers_detector,
+    open_redirect_detector,
     parser,
     reporter,
     ssrf_detector,
+    ssti_detector,
     xss_detector,
     xxe_detector,
 )
@@ -165,6 +170,77 @@ class FakeXXESession:
 
 
 # ---------------------------------------------------------------------------
+# Open redirect mock
+# ---------------------------------------------------------------------------
+class FakeOpenRedirectSession:
+    """Redirects (302) to whatever the 'next' parameter says (vulnerable)."""
+
+    def get(self, url, timeout=None, allow_redirects=False, **kwargs):
+        params = _params_from(url, None)
+        target = params.get("next", "")
+        if target.startswith("http") or target.startswith("//"):
+            return FakeResponse("", status_code=302, headers={"Location": target})
+        return FakeResponse("<html><body>home</body></html>")
+
+    def post(self, url, data=None, timeout=None, allow_redirects=False, **kwargs):
+        return self.get(url)
+
+
+# ---------------------------------------------------------------------------
+# SSTI mock
+# ---------------------------------------------------------------------------
+class FakeSSTISession:
+    """Evaluates a {{a*b}} expression in the 'name' parameter (vulnerable)."""
+
+    def get(self, url, timeout=None, allow_redirects=False, **kwargs):
+        return self._handle(url)
+
+    def post(self, url, data=None, timeout=None, allow_redirects=False, **kwargs):
+        return self._handle(url, data)
+
+    def _handle(self, url, data=None) -> FakeResponse:
+        name = _params_from(url, data).get("name", "")
+        # Evaluate any {{<int>*<int>}} expression (simulating a template engine).
+        rendered = re.sub(r"\{\{(\d+)\*(\d+)\}\}",
+                          lambda m: str(int(m.group(1)) * int(m.group(2))), name)
+        return FakeResponse(f"<html><body><h1>Hi {rendered}</h1></body></html>")
+
+
+# ---------------------------------------------------------------------------
+# CORS + security-headers mocks
+# ---------------------------------------------------------------------------
+class FakeCORSSession:
+    """Reflects the Origin header and allows credentials (misconfigured)."""
+
+    def get(self, url, timeout=None, allow_redirects=False, headers=None, **kwargs):
+        origin = (headers or {}).get("Origin", "")
+        return FakeResponse(
+            "<html><body>api</body></html>",
+            headers={
+                "Content-Type": "text/html",
+                "Access-Control-Allow-Origin": origin or "*",
+                "Access-Control-Allow-Credentials": "true",
+            },
+        )
+
+    def post(self, url, data=None, timeout=None, allow_redirects=False, **kwargs):
+        return self.get(url)
+
+
+class FakeNoHeadersSession:
+    """Returns a page with NO security headers and a weak cookie (vulnerable)."""
+
+    def get(self, url, timeout=None, allow_redirects=False, **kwargs):
+        return FakeResponse(
+            "<html><body>home</body></html>",
+            headers={"Content-Type": "text/html", "Set-Cookie": "session=abc; Path=/"},
+        )
+
+    def post(self, url, data=None, timeout=None, allow_redirects=False, **kwargs):
+        return self.get(url)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _new_scanner(session) -> Scanner:
@@ -265,6 +341,56 @@ def main() -> int:  # noqa: C901 - linear test script
     _print("xxe", s, "http://app.local/xmlapi")
     results.append(("XXE entity expansion detected",
                     any(f.category == "XXE" and f.confirmed for f in s.findings)))
+
+    # 10) Open redirect --------------------------------------------------
+    print("\n=== Case: Open Redirect (vulnerable 'next') ===")
+    s = _new_scanner(FakeOpenRedirectSession())
+    open_redirect_detector.run(
+        s, [parser.build_request_from_url("http://app.local/login?next=/home")])
+    _print("openredirect", s, "http://app.local/login?next=/home")
+    results.append(("Open redirect detected",
+                    any(f.category == "OpenRedirect" and f.confirmed for f in s.findings)))
+
+    # 11) SSTI -----------------------------------------------------------
+    print("\n=== Case: SSTI (template eval in 'name') ===")
+    s = _new_scanner(FakeSSTISession())
+    ssti_detector.run(
+        s, [parser.build_request_from_url("http://app.local/greet?name=bob")])
+    _print("ssti", s, "http://app.local/greet?name=bob")
+    results.append(("SSTI detected",
+                    any(f.category == "SSTI" and f.confirmed for f in s.findings)))
+
+    # 12) SSTI safe (no template engine) ---------------------------------
+    s = _new_scanner(FakeSafeSession())
+    ssti_detector.run(
+        s, [parser.build_request_from_url("http://app.local/greet?name=bob")])
+    results.append(("No SSTI on non-template app",
+                    not any(f.category == "SSTI" for f in s.findings)))
+
+    # 13) CORS misconfiguration ------------------------------------------
+    print("\n=== Case: CORS (reflected origin + credentials) ===")
+    s = _new_scanner(FakeCORSSession())
+    cors_detector.run(s, [parser.build_request_from_url("http://app.local/api")])
+    _print("cors", s, "http://app.local/api")
+    results.append(("CORS misconfiguration detected",
+                    any(f.category == "CORS" for f in s.findings)))
+
+    # 14) Security headers / cookie flags --------------------------------
+    print("\n=== Case: Missing security headers ===")
+    s = _new_scanner(FakeNoHeadersSession())
+    headers_detector.run(s, "http://app.local/")
+    _print("headers", s, "http://app.local/")
+    results.append(("Missing security headers reported",
+                    any(f.category == "SecurityHeaders" for f in s.findings)))
+
+    # 15) IDOR surface (informational) -----------------------------------
+    print("\n=== Case: IDOR surface (numeric id) ===")
+    s = _new_scanner(FakeSafeSession())
+    access_control_detector.run(
+        s, [parser.build_request_from_url("http://app.local/account?id=5")])
+    _print("idor", s, "http://app.local/account?id=5")
+    results.append(("IDOR surface flagged (Info)",
+                    any(f.category == "IDOR" for f in s.findings)))
 
     # --- Summary --------------------------------------------------------
     print("\n" + "=" * 60)
