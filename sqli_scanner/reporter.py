@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from .scanner import Finding, ScanStats
+from . import severity as sev_mod
 
 logger = logging.getLogger("sqli_scanner.reporter")
 
@@ -30,6 +31,7 @@ _COLORS = {
     "Critical": "\033[91m",
     "Medium": "\033[93m",    # yellow
     "Low": "\033[96m",       # cyan
+    "Info": "\033[90m",      # grey
     "reset": "\033[0m",
     "bold": "\033[1m",
     "green": "\033[92m",
@@ -43,6 +45,21 @@ def _c(text: str, key: str, use_color: bool) -> str:
     return f"{_COLORS.get(key, '')}{text}{_COLORS['reset']}"
 
 
+def effective_severity(finding: Finding) -> str:
+    """Return the finding's severity, deriving it if not explicitly set."""
+    return finding.severity or sev_mod.derive(
+        finding.risk, finding.confidence, finding.confirmed
+    )
+
+
+def _sorted_findings(findings: List[Finding]) -> List[Finding]:
+    """Sort findings most-severe first (then confirmed before possible)."""
+    return sorted(
+        findings,
+        key=lambda f: (sev_mod.rank(effective_severity(f)), not f.confirmed),
+    )
+
+
 def build_report_dict(
     target: str,
     findings: List[Finding],
@@ -50,19 +67,27 @@ def build_report_dict(
     crawl_info: Dict[str, object],
 ) -> Dict[str, object]:
     """Assemble the canonical report structure shared by all output formats."""
+    findings = _sorted_findings(findings)
     confirmed = [f for f in findings if f.confirmed]
     possible = [f for f in findings if not f.confirmed]
-    # Per-category breakdown (SQLi / XSS / XXE / CSRF / SSRF / ...).
+    # Per-category and per-severity breakdowns.
     by_category: Dict[str, int] = {}
+    by_severity: Dict[str, int] = {}
     for f in findings:
         by_category[f.category] = by_category.get(f.category, 0) + 1
+        sv = effective_severity(f)
+        by_severity[sv] = by_severity.get(sv, 0) + 1
+    # Order severity breakdown most-severe first.
+    by_severity_ordered = {
+        s: by_severity[s] for s in sev_mod.SEVERITY_ORDER if s in by_severity
+    }
     return {
         "tool": "Defensive Web Vulnerability Detection Scanner",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "disclaimer": (
             "Authorized security testing only. Detection-only tool: it confirms "
-            "the presence of vulnerabilities (SQLi, XSS, XXE, CSRF, SSRF) but "
-            "performs no data extraction, no exploitation, and no WAF bypass."
+            "the presence of vulnerabilities but performs no data extraction, "
+            "no exploitation, no auth/WAF bypass, and no destructive actions."
         ),
         "target": target,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -73,6 +98,7 @@ def build_report_dict(
             "requests_sent": stats.requests_sent,
             "confirmed_findings": len(confirmed),
             "possible_findings": len(possible),
+            "findings_by_severity": by_severity_ordered,
             "findings_by_category": by_category,
             "false_positive_filtered": stats.false_positive_filtered + stats.unstable_skipped,
             "unstable_endpoints_skipped": stats.unstable_skipped,
@@ -83,10 +109,13 @@ def build_report_dict(
 
 
 def _finding_to_dict(finding: Finding) -> Dict[str, object]:
-    """Serialize a Finding (including computed 'confirmed' flag)."""
+    """Serialize a Finding (including computed severity / status fields)."""
     data = asdict(finding)
+    sv = effective_severity(finding)
     data["confirmed"] = finding.confirmed
     data["status"] = "Confirmed" if finding.confirmed else "Possible"
+    data["severity"] = sv
+    data["cvss_band"] = sev_mod.cvss_band(sv)
     return data
 
 
@@ -103,6 +132,7 @@ def print_console_summary(
 ) -> None:
     """Print the end-of-scan console summary and per-finding details."""
     report_paths = report_paths or {}
+    findings = _sorted_findings(findings)
     confirmed = [f for f in findings if f.confirmed]
     possible = [f for f in findings if not f.confirmed]
 
@@ -119,6 +149,15 @@ def print_console_summary(
           f"{_c(str(len(confirmed)), 'High', use_color)}")
     print(f"  {_c('Possible findings', 'Medium', use_color)}       : "
           f"{_c(str(len(possible)), 'Medium', use_color)}")
+    # Per-severity breakdown (most severe first).
+    by_severity: Dict[str, int] = {}
+    for f in findings:
+        sv = effective_severity(f)
+        by_severity[sv] = by_severity.get(sv, 0) + 1
+    if by_severity:
+        parts = [f"{_c(s, s, use_color)}={by_severity[s]}"
+                 for s in sev_mod.SEVERITY_ORDER if s in by_severity]
+        print(f"  By severity             : {', '.join(parts)}")
     # Per-category breakdown.
     by_category: Dict[str, int] = {}
     for f in findings:
@@ -139,14 +178,14 @@ def print_console_summary(
     else:
         for idx, f in enumerate(findings, start=1):
             status = "Confirmed" if f.confirmed else "Possible"
-            status_key = "High" if f.confirmed else "Medium"
+            sev = effective_severity(f)
             print()
-            print(f"  [{idx}] {_c(status, status_key, use_color)} [{f.category}] - {f.vuln_type}")
+            print(f"  [{idx}] {_c(sev, sev, use_color)} | {status} [{f.category}] - {f.vuln_type}")
             print(f"      URL        : {f.url}")
             print(f"      Parameter  : {f.param}  ({f.location})")
             print(f"      Method     : {f.method}")
+            print(f"      Severity   : {_c(sev, sev, use_color)} (CVSS {sev_mod.cvss_band(sev)})")
             print(f"      Confidence : {_c(f.confidence, f.confidence, use_color)}")
-            print(f"      Risk       : {_c(f.risk, status_key, use_color)}")
             if f.dbms:
                 print(f"      DBMS       : {f.dbms}")
             print(f"      Signals    : {', '.join(f.matched_techniques)}")
@@ -192,11 +231,12 @@ def write_html_report(path: str, report: Dict[str, object]) -> str:
 
 
 def _badge(value: str) -> str:
-    """Return an HTML class name for a confidence/risk badge."""
+    """Return an HTML class name for a severity/confidence/risk badge."""
     mapping = {
-        "High": "badge-high", "Critical": "badge-high",
-        "Medium": "badge-medium", "Low": "badge-low",
+        "High": "badge-high", "Critical": "badge-critical",
+        "Medium": "badge-medium", "Low": "badge-low", "Info": "badge-info",
         "Confirmed": "badge-high", "Possible": "badge-medium",
+        "Informational": "badge-info",
     }
     return mapping.get(value, "badge-low")
 
@@ -211,6 +251,7 @@ def _render_html(report: Dict[str, object]) -> str:
     for idx, f in enumerate(findings, start=1):  # type: ignore
         status = f.get("status", "Possible")
         category = f.get("category", "SQLi")
+        sev = f.get("severity", "Info")
         evidence_items = "".join(
             f"<li>{e(str(item))}</li>" for item in f.get("evidence", [])
         ) or "<li>(no additional evidence captured)</li>"
@@ -225,11 +266,13 @@ def _render_html(report: Dict[str, object]) -> str:
         <div class="finding">
           <div class="finding-head">
             <span class="idx">#{idx}</span>
+            <span class="badge {_badge(str(sev))}">{e(str(sev))}</span>
             <span class="badge {_badge(status)}">{e(status)}</span>
             <span class="badge badge-cat">{e(str(category))}</span>
             <span class="vtype">{e(str(f.get('vuln_type', 'Vulnerability')))}</span>
           </div>
           <table class="kv">
+            <tr><th>Severity</th><td><span class="badge {_badge(str(sev))}">{e(str(sev))}</span> (CVSS {e(str(f.get('cvss_band','')))})</td></tr>
             <tr><th>Affected URL</th><td>{e(str(f.get('url', '')))}</td></tr>
             <tr><th>Parameter</th><td>{e(str(f.get('param', '')))} ({e(str(f.get('location', '')))})</td></tr>
             <tr><th>HTTP Method</th><td>{e(str(f.get('method', '')))}</td></tr>
@@ -285,8 +328,10 @@ def _render_html(report: Dict[str, object]) -> str:
   .badge {{ display:inline-block; padding:2px 10px; border-radius:999px;
             font-size:12px; font-weight:700; }}
   .badge-high {{ background:#3d1418; color:#ff8b94; border:1px solid #7a2630; }}
+  .badge-critical {{ background:#4a0d12; color:#ff6b78; border:1px solid #b3303d; }}
   .badge-medium {{ background:#3a2f10; color:#f6cd5b; border:1px solid #7a6420; }}
   .badge-low {{ background:#0f2a33; color:#69d2e7; border:1px solid #1d5564; }}
+  .badge-info {{ background:#23272e; color:#aab4c0; border:1px solid #3a414b; }}
   .badge-cat {{ background:#1a2a3d; color:#8fb8ff; border:1px solid #2f4a6b; }}
   table.kv {{ width:100%; border-collapse:collapse; margin:6px 0 4px; }}
   table.kv th {{ text-align:left; width:160px; color:var(--muted); font-weight:500;
