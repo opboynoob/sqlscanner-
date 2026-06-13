@@ -52,12 +52,17 @@ def build_report_dict(
     """Assemble the canonical report structure shared by all output formats."""
     confirmed = [f for f in findings if f.confirmed]
     possible = [f for f in findings if not f.confirmed]
+    # Per-category breakdown (SQLi / XSS / XXE / CSRF / SSRF / ...).
+    by_category: Dict[str, int] = {}
+    for f in findings:
+        by_category[f.category] = by_category.get(f.category, 0) + 1
     return {
-        "tool": "Defensive SQLi Detection Scanner",
-        "version": "1.0.0",
+        "tool": "Defensive Web Vulnerability Detection Scanner",
+        "version": "2.0.0",
         "disclaimer": (
-            "Authorized security testing only. Detection-only tool: no data "
-            "extraction or exploitation is performed."
+            "Authorized security testing only. Detection-only tool: it confirms "
+            "the presence of vulnerabilities (SQLi, XSS, XXE, CSRF, SSRF) but "
+            "performs no data extraction, no exploitation, and no WAF bypass."
         ),
         "target": target,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -68,6 +73,7 @@ def build_report_dict(
             "requests_sent": stats.requests_sent,
             "confirmed_findings": len(confirmed),
             "possible_findings": len(possible),
+            "findings_by_category": by_category,
             "false_positive_filtered": stats.false_positive_filtered + stats.unstable_skipped,
             "unstable_endpoints_skipped": stats.unstable_skipped,
             "request_budget_exhausted": stats.budget_exhausted,
@@ -102,17 +108,24 @@ def print_console_summary(
 
     line = "=" * 70
     print(line)
-    print(_c("  SQL INJECTION DETECTION - SCAN SUMMARY", "bold", use_color))
+    print(_c("  WEB VULNERABILITY DETECTION - SCAN SUMMARY", "bold", use_color))
     print(line)
     print(f"  Target                  : {target}")
     print(f"  Total URLs crawled      : {crawl_info.get('urls_crawled', 0)}")
     print(f"  Unsafe actions skipped  : {crawl_info.get('unsafe_skipped', 0)}")
     print(f"  Total parameters tested : {stats.params_tested}")
     print(f"  Total requests sent     : {stats.requests_sent}")
-    print(f"  {_c('Confirmed SQLi findings', 'High', use_color)} : "
+    print(f"  {_c('Confirmed findings', 'High', use_color)}      : "
           f"{_c(str(len(confirmed)), 'High', use_color)}")
-    print(f"  {_c('Possible SQLi findings', 'Medium', use_color)}  : "
+    print(f"  {_c('Possible findings', 'Medium', use_color)}       : "
           f"{_c(str(len(possible)), 'Medium', use_color)}")
+    # Per-category breakdown.
+    by_category: Dict[str, int] = {}
+    for f in findings:
+        by_category[f.category] = by_category.get(f.category, 0) + 1
+    if by_category:
+        breakdown = ", ".join(f"{cat}={n}" for cat, n in sorted(by_category.items()))
+        print(f"  By category             : {breakdown}")
     print(f"  False-positive filtered : "
           f"{stats.false_positive_filtered + stats.unstable_skipped} "
           f"(unstable endpoints: {stats.unstable_skipped})")
@@ -122,13 +135,13 @@ def print_console_summary(
     print(line)
 
     if not findings:
-        print(_c("  No SQL injection indicators detected.", "green", use_color))
+        print(_c("  No vulnerability indicators detected.", "green", use_color))
     else:
         for idx, f in enumerate(findings, start=1):
             status = "Confirmed" if f.confirmed else "Possible"
             status_key = "High" if f.confirmed else "Medium"
             print()
-            print(f"  [{idx}] {_c(status, status_key, use_color)} - {f.vuln_type}")
+            print(f"  [{idx}] {_c(status, status_key, use_color)} [{f.category}] - {f.vuln_type}")
             print(f"      URL        : {f.url}")
             print(f"      Parameter  : {f.param}  ({f.location})")
             print(f"      Method     : {f.method}")
@@ -197,18 +210,24 @@ def _render_html(report: Dict[str, object]) -> str:
     rows = []
     for idx, f in enumerate(findings, start=1):  # type: ignore
         status = f.get("status", "Possible")
+        category = f.get("category", "SQLi")
         evidence_items = "".join(
             f"<li>{e(str(item))}</li>" for item in f.get("evidence", [])
         ) or "<li>(no additional evidence captured)</li>"
         repro_items = "".join(
             f"<li>{e(str(step))}</li>" for step in f.get("reproduction", [])
         )
+        dbms_row = (
+            f"<tr><th>Detected DBMS</th><td>{e(str(f.get('dbms')))}</td></tr>"
+            if f.get("dbms") else ""
+        )
         rows.append(f"""
         <div class="finding">
           <div class="finding-head">
             <span class="idx">#{idx}</span>
             <span class="badge {_badge(status)}">{e(status)}</span>
-            <span class="vtype">{e(str(f.get('vuln_type', 'SQL Injection')))}</span>
+            <span class="badge badge-cat">{e(str(category))}</span>
+            <span class="vtype">{e(str(f.get('vuln_type', 'Vulnerability')))}</span>
           </div>
           <table class="kv">
             <tr><th>Affected URL</th><td>{e(str(f.get('url', '')))}</td></tr>
@@ -216,7 +235,7 @@ def _render_html(report: Dict[str, object]) -> str:
             <tr><th>HTTP Method</th><td>{e(str(f.get('method', '')))}</td></tr>
             <tr><th>Confidence</th><td><span class="badge {_badge(str(f.get('confidence','')))}">{e(str(f.get('confidence', '')))}</span></td></tr>
             <tr><th>Risk Level</th><td><span class="badge {_badge(str(f.get('risk','')))}">{e(str(f.get('risk', '')))}</span></td></tr>
-            <tr><th>Detected DBMS</th><td>{e(str(f.get('dbms') or 'Unknown'))}</td></tr>
+            {dbms_row}
             <tr><th>Signals Matched</th><td>{e(', '.join(f.get('matched_techniques', [])))}</td></tr>
             <tr><th>CWE</th><td>{e(str(f.get('cwe', '')))}</td></tr>
             <tr><th>OWASP</th><td>{e(str(f.get('owasp', '')))}</td></tr>
@@ -231,7 +250,7 @@ def _render_html(report: Dict[str, object]) -> str:
         """)
 
     findings_html = "\n".join(rows) if rows else (
-        "<p class='ok'>No SQL injection indicators detected.</p>"
+        "<p class='ok'>No vulnerability indicators detected.</p>"
     )
 
     return f"""<!DOCTYPE html>
@@ -239,7 +258,7 @@ def _render_html(report: Dict[str, object]) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SQLi Detection Report</title>
+<title>Web Vulnerability Detection Report</title>
 <style>
   :root {{ --bg:#0f1720; --card:#1b2733; --muted:#8aa0b2; --fg:#e6edf3; --accent:#4da3ff; }}
   * {{ box-sizing: border-box; }}
@@ -268,6 +287,7 @@ def _render_html(report: Dict[str, object]) -> str:
   .badge-high {{ background:#3d1418; color:#ff8b94; border:1px solid #7a2630; }}
   .badge-medium {{ background:#3a2f10; color:#f6cd5b; border:1px solid #7a6420; }}
   .badge-low {{ background:#0f2a33; color:#69d2e7; border:1px solid #1d5564; }}
+  .badge-cat {{ background:#1a2a3d; color:#8fb8ff; border:1px solid #2f4a6b; }}
   table.kv {{ width:100%; border-collapse:collapse; margin:6px 0 4px; }}
   table.kv th {{ text-align:left; width:160px; color:var(--muted); font-weight:500;
                  padding:4px 8px; vertical-align:top; font-size:13px; }}
@@ -281,7 +301,7 @@ def _render_html(report: Dict[str, object]) -> str:
 </head>
 <body>
 <header>
-  <h1>SQL Injection Detection Report</h1>
+  <h1>Web Vulnerability Detection Report</h1>
   <div class="sub">Target: {e(str(report.get('target','')))} &middot; Generated: {e(str(report.get('generated_at','')))}</div>
 </header>
 <div class="disclaimer"><strong>Authorized testing only.</strong> {e(str(report.get('disclaimer','')))}</div>
@@ -297,7 +317,7 @@ def _render_html(report: Dict[str, object]) -> str:
   <h2>Findings</h2>
   {findings_html}
 </div>
-<footer>Generated by Defensive SQLi Detection Scanner v{e(str(report.get('version','1.0.0')))}.
+<footer>Generated by Defensive Web Vulnerability Detection Scanner v{e(str(report.get('version','2.0.0')))}.
 Detection-only &middot; no data extraction or exploitation performed.</footer>
 </body>
 </html>"""

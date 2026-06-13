@@ -2,14 +2,15 @@
 main.py
 =======
 
-Command-line entry point for the defensive SQL injection detection scanner.
+Command-line entry point for the defensive web vulnerability detection scanner.
 
 Usage:
     python3 -m sqli_scanner.main "https://target.example.com/page?id=1"
 
 The user supplies ONE target URL; the tool discovers and tests parameters
 automatically (query string, forms, JSON body if provided, path-like values),
-crawling the same host within a safe depth limit.
+crawling the same host within a safe depth limit, and runs detection-only checks
+for SQL injection, reflected XSS, CSRF, SSRF, and (opt-in) XXE.
 
 AUTHORIZED USE ONLY. Only run against systems you own or are explicitly
 permitted to test.
@@ -25,19 +26,24 @@ from urllib.parse import urlparse
 
 from . import parser as param_parser
 from . import reporter
+from . import xss_detector, xxe_detector, csrf_detector, ssrf_detector
 from .crawler import Crawler, CrawlConfig
 from .scanner import Scanner, ScanConfig
 
 LOG = logging.getLogger("sqli_scanner")
 
+ALL_CHECKS = ("sqli", "xss", "csrf", "ssrf", "xxe")
+DEFAULT_CHECKS = ("sqli", "xss", "csrf", "ssrf")  # xxe is opt-in
+
 BANNER = r"""
-  ____   ___  _     _   ____       _            _
- / ___| / _ \| |   (_) |  _ \  ___| |_ ___  ___| |_
- \___ \| | | | |   | | | | | |/ _ \ __/ _ \/ __| __|
-  ___) | |_| | |___| | | |_| |  __/ ||  __/ (__| |_
- |____/ \__\_\_____|_| |____/ \___|\__\___|\___|\__|
-   Defensive SQL Injection Detection Scanner v1.0
-   ----------------------------------------------
+  __        __   _    ____                  _   _      _
+  \ \      / /__| |__/ ___|  ___ __ _ _ __ | \ | | ___| |_
+   \ \ /\ / / _ \ '_ \___ \ / __/ _` | '_ \|  \| |/ _ \ __|
+    \ V  V /  __/ |_) |__) | (_| (_| | | | | |\  |  __/ |_
+     \_/\_/ \___|_.__/____/ \___\__,_|_| |_|_| \_|\___|\__|
+   Defensive Web Vulnerability Detection Scanner v2.0
+   Detects: SQLi  |  XSS  |  XXE  |  CSRF  |  SSRF
+   ---------------------------------------------------
    AUTHORIZED SECURITY TESTING ONLY. Detection-only:
    no data extraction, no exploitation, no WAF bypass.
 """
@@ -47,14 +53,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Construct the CLI argument parser."""
     p = argparse.ArgumentParser(
         prog="sqli_scanner",
-        description="Defensive, detection-only SQL injection scanner for "
-                    "authorized VAPT. Discovers and safely tests parameters "
-                    "for a single target URL.",
+        description="Defensive, detection-only web vulnerability scanner for "
+                    "authorized VAPT. Discovers and safely tests parameters for "
+                    "a single target URL across SQLi, XSS, XXE, CSRF and SSRF.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
         epilog="AUTHORIZED USE ONLY. You are responsible for ensuring you have "
                "permission to test the target.",
     )
     p.add_argument("url", help="Single target URL (include scheme, e.g. https://...)")
+
+    # Check selection
+    p.add_argument("--checks", default=None,
+                   help="Comma-separated subset of checks to run "
+                        "(choices: sqli,xss,csrf,ssrf,xxe). "
+                        "Default: sqli,xss,csrf,ssrf (xxe is opt-in).")
+    p.add_argument("--ssrf-canary", default=None,
+                   help="Your OWN public OAST/canary URL for safe SSRF "
+                        "confirmation. Internal/loopback/metadata targets are "
+                        "refused. Without this, SSRF is reported passively.")
+    p.add_argument("--test-xml", action="store_true",
+                   help="Enable the XXE check (POSTs benign XML with an internal "
+                        "entity). Only meaningful for XML-accepting endpoints.")
+    p.add_argument("--xml-body", default=None,
+                   help="Optional raw XML body used to confirm an XML endpoint "
+                        "(the XXE probe always uses a safe internal entity).")
+    p.add_argument("--csrf-cookie-check", action="store_true",
+                   help="For CSRF, also issue one GET to inspect Set-Cookie "
+                        "SameSite attributes.")
 
     # Crawling / scope
     p.add_argument("--max-depth", type=int, default=2,
@@ -188,6 +213,25 @@ def validate_url(url: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+def resolve_checks(args) -> set:
+    """Determine the enabled set of checks from CLI options."""
+    if args.checks:
+        requested = {c.strip().lower() for c in args.checks.split(",") if c.strip()}
+        unknown = requested - set(ALL_CHECKS)
+        if unknown:
+            LOG.warning("Ignoring unknown checks: %s", ", ".join(sorted(unknown)))
+        enabled = requested & set(ALL_CHECKS)
+    else:
+        enabled = set(DEFAULT_CHECKS)
+    # --test-xml is a convenience switch for enabling XXE.
+    if args.test_xml:
+        enabled.add("xxe")
+    if not enabled:
+        LOG.warning("No valid checks selected; defaulting to: %s", ", ".join(DEFAULT_CHECKS))
+        enabled = set(DEFAULT_CHECKS)
+    return enabled
+
+
 def run(args) -> int:
     """Execute the full scan workflow. Returns a process exit code."""
     if not args.no_color:
@@ -248,6 +292,9 @@ def run(args) -> int:
         )
 
     # --- Scan phase ----------------------------------------------------
+    enabled_checks = resolve_checks(args)
+    LOG.info("Enabled checks: %s", ", ".join(sorted(enabled_checks)))
+
     scan_config = ScanConfig(
         delay=args.delay,
         timeout=args.timeout,
@@ -256,9 +303,36 @@ def run(args) -> int:
         enable_time_based=not args.no_time_based,
         allow_destructive_methods=args.allow_destructive_methods,
         test_path_params=not args.no_path_test,
+        enable_sqli="sqli" in enabled_checks,
+        enable_xss="xss" in enabled_checks,
+        enable_csrf="csrf" in enabled_checks,
+        enable_ssrf="ssrf" in enabled_checks,
+        enable_xxe="xxe" in enabled_checks,
+        ssrf_canary=args.ssrf_canary,
+        xml_body=args.xml_body,
     )
     scanner = Scanner(session, scan_config)
-    findings = scanner.scan_templates(templates)
+
+    # Each detector appends its findings to the shared scanner via note_finding
+    # (SQLi appends internally), so we collect from scanner.findings at the end.
+    # Modules catch their own budget-exhaustion and return early.
+    if scan_config.enable_sqli:
+        LOG.info("Running SQL injection checks...")
+        scanner.scan_templates(templates)
+    if scan_config.enable_xss:
+        LOG.info("Running reflected XSS checks...")
+        xss_detector.run(scanner, templates)
+    if scan_config.enable_csrf:
+        LOG.info("Running CSRF checks (passive)...")
+        csrf_detector.run(scanner, templates, check_cookies=args.csrf_cookie_check)
+    if scan_config.enable_ssrf:
+        LOG.info("Running SSRF checks...")
+        ssrf_detector.run(scanner, templates, canary=scan_config.ssrf_canary)
+    if scan_config.enable_xxe:
+        LOG.info("Running XXE checks (safe internal-entity probe)...")
+        xxe_detector.run(scanner, args.url, xml_body=scan_config.xml_body)
+
+    findings = scanner.findings
 
     # --- Report phase --------------------------------------------------
     crawl_info = {"urls_crawled": len(visited), "unsafe_skipped": unsafe_skipped}

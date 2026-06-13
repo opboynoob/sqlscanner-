@@ -63,11 +63,36 @@ class ScanConfig:
     enable_time_based: bool = True
     allow_destructive_methods: bool = False  # gate on non GET/POST methods
     test_path_params: bool = True
+    # Which checks to run. SQLi/XSS are active param tests; CSRF is passive;
+    # XXE and the active SSRF canary are opt-in.
+    enable_sqli: bool = True
+    enable_xss: bool = True
+    enable_csrf: bool = True
+    enable_ssrf: bool = True
+    enable_xxe: bool = False           # opt-in (needs an XML-accepting endpoint)
+    ssrf_canary: Optional[str] = None  # user-controlled OAST domain for SSRF
+    xml_body: Optional[str] = None     # optional raw XML body for XXE probing
+
+
+@dataclass
+class FullResponse:
+    """A richer response wrapper exposing headers/status for non-SQLi checks."""
+
+    metrics: "ResponseMetrics"
+    text: str
+    headers: Dict[str, str]
+    status: int
+    elapsed: float
 
 
 @dataclass
 class Finding:
-    """A single reported (candidate or confirmed) SQLi issue."""
+    """A single reported (candidate or confirmed) vulnerability.
+
+    Generalized to cover multiple categories (SQLi, XSS, XXE, CSRF, SSRF). The
+    ``category`` field identifies the vulnerability class; ``confirmed`` is set
+    explicitly by each detector according to its own confirmation policy.
+    """
 
     vuln_type: str
     url: str
@@ -76,17 +101,15 @@ class Finding:
     location: str
     confidence: str
     risk: str
-    dbms: Optional[str]
+    category: str = "SQLi"
+    dbms: Optional[str] = None
     evidence: List[str] = field(default_factory=list)
     matched_techniques: List[str] = field(default_factory=list)
     reproduction: List[str] = field(default_factory=list)
     remediation: str = REMEDIATION
     cwe: str = CWE_SQLI
     owasp: str = OWASP_SQLI
-
-    @property
-    def confirmed(self) -> bool:
-        return len(set(self.matched_techniques)) >= 2
+    confirmed: bool = False
 
 
 @dataclass
@@ -177,6 +200,104 @@ class Scanner:
             dbms_error=detector.fingerprint_dbms(text),
         )
         return metrics, text
+
+    # ------------------------------------------------------------------
+    # Header-exposing probe (used by XSS / XXE / CSRF / SSRF detectors)
+    # ------------------------------------------------------------------
+    def send_full(
+        self,
+        method: str,
+        url: str,
+        data: Optional[Dict[str, str]] = None,
+        json_body: Optional[str] = None,
+        raw_body: Optional[str] = None,
+        content_type: Optional[str] = None,
+        allow_redirects: bool = False,
+    ) -> Optional["FullResponse"]:
+        """Send a request and return a ``FullResponse`` (metrics + text + headers).
+
+        Mirrors ``_send`` safety (budget, delay, timeout, method guard) but also
+        exposes response headers and status, which the non-SQLi detectors need
+        (e.g. redirect ``Location`` for SSRF, ``Set-Cookie`` for CSRF). Supports
+        a ``raw_body`` with an explicit ``content_type`` (used for XML probes).
+        """
+        if self.stats.requests_sent >= self.config.max_requests:
+            self.stats.budget_exhausted = True
+            raise RequestBudgetError("Global request budget exhausted.")
+
+        method = method.upper()
+        if method not in ("GET", "POST") and not self.config.allow_destructive_methods:
+            logger.warning("Refusing non-GET/POST method %s (destructive guard).", method)
+            return None
+
+        headers: Dict[str, str] = {}
+        if content_type:
+            headers["Content-Type"] = content_type
+
+        time.sleep(self.config.delay)
+        start = time.perf_counter()
+        try:
+            if method == "POST":
+                if raw_body is not None:
+                    resp = self.session.post(
+                        url, data=raw_body, timeout=self.config.timeout,
+                        headers=headers or None, allow_redirects=allow_redirects,
+                    )
+                elif json_body is not None:
+                    resp = self.session.post(
+                        url, data=json_body, timeout=self.config.timeout,
+                        headers={"Content-Type": "application/json"},
+                        allow_redirects=allow_redirects,
+                    )
+                else:
+                    resp = self.session.post(
+                        url, data=data or {}, timeout=self.config.timeout,
+                        headers=headers or None, allow_redirects=allow_redirects,
+                    )
+            else:
+                resp = self.session.get(
+                    url, timeout=self.config.timeout, headers=headers or None,
+                    allow_redirects=allow_redirects,
+                )
+        except Exception as exc:
+            logger.debug("send_full error (%s) for %s", exc, url)
+            self.stats.requests_sent += 1
+            return None
+        finally:
+            self.stats.requests_sent += 1
+
+        elapsed = time.perf_counter() - start
+        text = resp.text or ""
+        metrics = ResponseMetrics(
+            status=resp.status_code,
+            length=len(text),
+            elapsed=elapsed,
+            content_hash=hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest(),
+            dbms_error=detector.fingerprint_dbms(text),
+        )
+        # Normalize headers into a plain dict (case-insensitive lookups by caller).
+        resp_headers = {k: v for k, v in getattr(resp, "headers", {}).items()}
+        return FullResponse(metrics=metrics, text=text, headers=resp_headers,
+                            status=resp.status_code, elapsed=elapsed)
+
+    def probe_point(
+        self, point: InjectionPoint, injected_value: str,
+        allow_redirects: bool = False,
+    ) -> Optional["FullResponse"]:
+        """Materialize an injection point with a value and send it (full response)."""
+        method, url, data, json_body, _ = parser.materialize(point, injected_value)
+        return self.send_full(method, url, data=data, json_body=json_body,
+                              allow_redirects=allow_redirects)
+
+    def note_finding(self, finding: "Finding") -> None:
+        """Record a finding from an external detector and update counters."""
+        self.findings.append(finding)
+        if finding.confirmed:
+            self.stats.confirmed += 1
+        else:
+            self.stats.possible += 1
+        logger.info("Finding: %s param='%s' confidence=%s",
+                    finding.vuln_type, finding.param, finding.confidence)
 
     # ------------------------------------------------------------------
     # Baseline & stability
@@ -451,10 +572,12 @@ class Scanner:
             location=point.location,
             confidence=confidence,
             risk=risk,
+            category="SQLi",
             dbms=dbms,
             evidence=evidence,
             matched_techniques=techniques,
             reproduction=repro,
+            confirmed=len(set(techniques)) >= 2,
         )
 
         if finding.confirmed:
